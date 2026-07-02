@@ -3,9 +3,15 @@
 
    MÓDULOS ACTIVOS:
      - Tema claro/oscuro, acordeones, tabs de consola (interfaz general)
-     - Drag & drop de componentes: biblioteca -> riel DIN
+     - Arrastre de componentes (biblioteca -> riel DIN) usando Pointer Events,
+       compatible con mouse Y con pantallas táctiles (celular/tablet).
      - Reordenar / seleccionar / eliminar componentes ya colocados
      - Panel de propiedades: se completa con datos reales al seleccionar
+
+   NOTA TÉCNICA: se usa la API de Pointer Events (pointerdown/move/up) en
+   lugar del Drag & Drop nativo de HTML5 (dragstart/dragover/drop), porque
+   ese último NO funciona en pantallas táctiles. Pointer Events sí unifica
+   mouse, lápiz y dedo con la misma lógica.
 
    PENDIENTE PARA PRÓXIMAS ETAPAS:
      - Conexión de bornes (cables) entre componentes -> scripts/ui/
@@ -68,13 +74,8 @@ document.addEventListener('DOMContentLoaded', () => {
       spec: card.querySelector('.comp-spec').textContent.trim(),
       iconHTML: card.querySelector('.comp-icon').innerHTML,
     };
-    card.addEventListener('dragstart', (e) => {
-      e.dataTransfer.setData('text/component-type', type);
-      e.dataTransfer.effectAllowed = 'copy';
-    });
   });
 
-  // Ancho relativo en "slots" de riel (aprox. proporcional a polos/tamaño físico)
   const WIDTHS = {
     'red-220v': 3, 'medidor': 2,
     'interruptor-general': 2, 'diferencial': 2, 'termica-unipolar': 1,
@@ -95,6 +96,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const SLOT_PX = 34;
   const MAX_SLOTS = 18;
+  const DRAG_THRESHOLD = 6; // px de movimiento antes de considerar que es un arrastre y no un toque
 
   /* =====================================================================
      2. ESTADO DEL TABLERO
@@ -102,6 +104,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let placed = [];       // [{ id, type, notes }]
   let selectedId = null;
 
+  const library = document.querySelector('.library');
   const track = document.getElementById('modulesTrack');
   const railWrap = document.getElementById('dinRailWrap');
   const canvasSurface = document.getElementById('canvasSurface');
@@ -146,7 +149,6 @@ document.addEventListener('DOMContentLoaded', () => {
       const el = document.createElement('div');
       el.className = 'rail-module cat-' + CATEGORY[item.type] + (item.id === selectedId ? ' selected' : '');
       el.style.width = (WIDTHS[item.type] * SLOT_PX) + 'px';
-      el.draggable = true;
       el.dataset.id = item.id;
       el.title = def.name + ' — ' + def.spec;
 
@@ -200,9 +202,25 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('fNotes').value = item.notes || '';
   }
 
+  function removeComponent(id) {
+    const item = placed.find((p) => p.id === id);
+    placed = placed.filter((p) => p.id !== id);
+    if (selectedId === id) showProps(null);
+    if (item) log('Componente eliminado: ' + LIBRARY[item.type].name, 'warn');
+    renderRail();
+  }
+
+  function selectComponent(id) {
+    selectedId = id;
+    renderRail();
+    showProps(placed.find((p) => p.id === id));
+  }
+
   /* =====================================================================
-     4. DRAG & DROP: soltar componentes nuevos sobre el riel
+     4. ARRASTRE (Pointer Events — funciona con mouse, lápiz y dedo)
      ================================================================== */
+  let drag = null; // { kind:'new'|'reorder', componentType, moduleId, startX, startY, dragging, ghost }
+
   function computeInsertIndex(clientX) {
     const rect = track.getBoundingClientRect();
     const x = clientX - rect.left;
@@ -215,78 +233,145 @@ document.addEventListener('DOMContentLoaded', () => {
     return placed.length;
   }
 
-  canvasSurface.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = e.dataTransfer.getData('text/reorder-id') ? 'move' : 'copy';
-    railWrap.classList.add('drag-over');
-  });
+  function isOverRail(clientX, clientY) {
+    const r = railWrap.getBoundingClientRect();
+    const pad = 40; // margen de tolerancia para soltar más fácil
+    return clientX >= r.left - pad && clientX <= r.right + pad &&
+           clientY >= r.top - pad && clientY <= r.bottom + pad;
+  }
 
-  canvasSurface.addEventListener('dragleave', (e) => {
-    if (!railWrap.contains(e.relatedTarget)) railWrap.classList.remove('drag-over');
-  });
+  function makeGhost(iconHTML, name) {
+    const g = document.createElement('div');
+    g.className = 'drag-ghost';
+    g.style.width = '64px';
+    g.innerHTML =
+      '<div class="module-icon">' + iconHTML + '</div>' +
+      '<div class="module-label">' + name + '</div>';
+    document.body.appendChild(g);
+    return g;
+  }
 
-  canvasSurface.addEventListener('drop', (e) => {
+  function startDrag(e, opts) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    drag = {
+      kind: opts.kind,
+      componentType: opts.componentType,
+      moduleId: opts.moduleId,
+      startX: e.clientX,
+      startY: e.clientY,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      dragging: false,
+      ghost: null,
+      pointerId: e.pointerId,
+    };
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', onPointerUp);
+    document.addEventListener('pointercancel', onPointerUp);
+  }
+
+  function onPointerMove(e) {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    drag.lastX = e.clientX;
+    drag.lastY = e.clientY;
+
+    if (!drag.dragging) {
+      const dx = e.clientX - drag.startX;
+      const dy = e.clientY - drag.startY;
+      if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+      drag.dragging = true;
+
+      // Al confirmar el arrastre, crear el "fantasma" que sigue al dedo/cursor
+      const def = drag.kind === 'new' ? LIBRARY[drag.componentType]
+        : LIBRARY[placed.find((p) => p.id === drag.moduleId).type];
+      drag.ghost = makeGhost(def.iconHTML, def.name);
+
+      // Si es reordenamiento, ocultamos visualmente el módulo original mientras se mueve
+      if (drag.kind === 'reorder') {
+        const el = track.querySelector('[data-id="' + drag.moduleId + '"]');
+        if (el) el.style.opacity = '.25';
+      }
+    }
+
     e.preventDefault();
+    drag.ghost.style.left = e.clientX + 'px';
+    drag.ghost.style.top = e.clientY + 'px';
+    railWrap.classList.toggle('drag-over', isOverRail(e.clientX, e.clientY));
+  }
+
+  function onPointerUp(e) {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    document.removeEventListener('pointermove', onPointerMove);
+    document.removeEventListener('pointerup', onPointerUp);
+    document.removeEventListener('pointercancel', onPointerUp);
     railWrap.classList.remove('drag-over');
 
-    const newType = e.dataTransfer.getData('text/component-type');
-    const reorderId = e.dataTransfer.getData('text/reorder-id');
-    const insertIndex = computeInsertIndex(e.clientX);
-
-    if (newType) {
-      if (totalSlotsUsed() + WIDTHS[newType] > MAX_SLOTS) {
-        log('El riel está lleno — no se puede agregar "' + LIBRARY[newType].name + '".', 'warn');
-        return;
+    if (drag.dragging) {
+      if (drag.ghost) drag.ghost.remove();
+      if (drag.kind === 'reorder') {
+        const el = track.querySelector('[data-id="' + drag.moduleId + '"]');
+        if (el) el.style.opacity = '';
       }
-      placed.splice(insertIndex, 0, { id: uid(), type: newType, notes: '' });
-      log('Componente agregado: ' + LIBRARY[newType].name, 'ok');
-      selectedId = placed[insertIndex].id;
-      renderRail();
-      showProps(placed[insertIndex]);
-    } else if (reorderId) {
-      const fromIdx = placed.findIndex((p) => p.id === reorderId);
-      if (fromIdx === -1) return;
-      const [moved] = placed.splice(fromIdx, 1);
-      let idx = insertIndex;
-      if (fromIdx < idx) idx--;
-      placed.splice(idx, 0, moved);
-      renderRail();
+
+      const dropped = isOverRail(drag.lastX, drag.lastY);
+      if (dropped) {
+        const insertIndex = computeInsertIndex(drag.lastX);
+
+        if (drag.kind === 'new') {
+          if (totalSlotsUsed() + WIDTHS[drag.componentType] > MAX_SLOTS) {
+            log('El riel está lleno — no se puede agregar "' + LIBRARY[drag.componentType].name + '".', 'warn');
+          } else {
+            const newItem = { id: uid(), type: drag.componentType, notes: '' };
+            placed.splice(insertIndex, 0, newItem);
+            log('Componente agregado: ' + LIBRARY[drag.componentType].name, 'ok');
+            selectComponent(newItem.id);
+          }
+        } else if (drag.kind === 'reorder') {
+          const fromIdx = placed.findIndex((p) => p.id === drag.moduleId);
+          if (fromIdx !== -1) {
+            const [moved] = placed.splice(fromIdx, 1);
+            let idx = insertIndex;
+            if (fromIdx < idx) idx--;
+            placed.splice(idx, 0, moved);
+          }
+        }
+        renderRail();
+      }
+    } else {
+      // No hubo arrastre real: fue un toque/clic simple
+      if (drag.kind === 'reorder') selectComponent(drag.moduleId);
     }
+
+    drag = null;
+  }
+
+  // Origen 1: tarjetas de la biblioteca (siempre agregan un componente nuevo)
+  library.addEventListener('pointerdown', (e) => {
+    const card = e.target.closest('.comp-card');
+    if (!card) return;
+    startDrag(e, { kind: 'new', componentType: card.dataset.component });
   });
 
-  /* =====================================================================
-     5. INTERACCIÓN CON MÓDULOS YA COLOCADOS (reordenar / seleccionar / borrar)
-     ================================================================== */
-  track.addEventListener('dragstart', (e) => {
+  // Origen 2: módulos ya colocados en el riel (reordenar o, si no se mueve, seleccionar)
+  track.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.module-remove')) return; // el botón de borrar se maneja aparte
     const mod = e.target.closest('.rail-module');
     if (!mod) return;
-    e.dataTransfer.setData('text/reorder-id', mod.dataset.id);
-    e.dataTransfer.effectAllowed = 'move';
+    startDrag(e, { kind: 'reorder', moduleId: mod.dataset.id });
   });
 
+  // Botón de eliminar y clic en fondo vacío del canvas para deseleccionar
   canvasSurface.addEventListener('click', (e) => {
     const removeBtn = e.target.closest('.module-remove');
-    const mod = e.target.closest('.rail-module');
-
-    if (removeBtn && mod) {
-      const item = placed.find((p) => p.id === mod.dataset.id);
-      placed = placed.filter((p) => p.id !== mod.dataset.id);
-      if (selectedId === mod.dataset.id) showProps(null);
-      if (item) log('Componente eliminado: ' + LIBRARY[item.type].name, 'warn');
-      renderRail();
+    if (removeBtn) {
+      const mod = e.target.closest('.rail-module');
+      if (mod) removeComponent(mod.dataset.id);
       return;
     }
-
-    if (mod) {
-      selectedId = mod.dataset.id;
+    if (!e.target.closest('.rail-module')) {
+      showProps(null);
       renderRail();
-      showProps(placed.find((p) => p.id === selectedId));
-      return;
     }
-
-    // Clic en el fondo del canvas: deseleccionar
-    showProps(null);
-    renderRail();
   });
 
   document.addEventListener('keydown', (e) => {
@@ -294,11 +379,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const activeTag = document.activeElement.tagName;
     if (activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT') return;
     if (!selectedId) return;
-    const item = placed.find((p) => p.id === selectedId);
-    placed = placed.filter((p) => p.id !== selectedId);
-    if (item) log('Componente eliminado: ' + LIBRARY[item.type].name, 'warn');
-    showProps(null);
-    renderRail();
+    removeComponent(selectedId);
   });
 
   /* ---- estado inicial ---- */
